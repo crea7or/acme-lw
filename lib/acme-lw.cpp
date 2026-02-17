@@ -17,6 +17,8 @@
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
+#include <openssl/ec.h>
+#include <openssl/ecdsa.h>
 #include <openssl/x509v3.h>
 
 #if OPENSSL_VERSION_MAJOR >= 3
@@ -110,12 +112,180 @@ typedef Ptr<BIO, BIO_free_all>                                  BIOptr;
 typedef Ptr<BIGNUM, BN_clear_free>                              BIGNUMptr;
 typedef Ptr<EVP_MD_CTX, EVP_MD_CTX_free>                        EVP_MD_CTXptr;
 typedef Ptr<EVP_PKEY, EVP_PKEY_free>                            EVP_PKEYptr;
+typedef Ptr<EVP_PKEY_CTX, EVP_PKEY_CTX_free>                    EVP_PKEY_CTXptr;
 typedef Ptr<X509, X509_free>                                    X509ptr;
 typedef Ptr<X509_REQ, X509_REQ_free>                            X509_REQptr;
 
 #if OPENSSL_VERSION_MAJOR < 3
 typedef Ptr<RSA, RSA_free>                                      RSAptr;
+typedef Ptr<EC_KEY, EC_KEY_free>                                EC_KEYptr;
 #endif
+typedef Ptr<BN_CTX, BN_CTX_free>                                BN_CTXptr;
+typedef Ptr<ECDSA_SIG, ECDSA_SIG_free>                          ECDSA_SIGptr;
+
+enum class AccountKeyAlgorithm { RS256, ES256 };
+
+string urlSafeBase64Encode(const BIGNUM * bn);
+
+AccountKeyAlgorithm getAccountKeyAlgorithm(EVP_PKEY * key)
+{
+    int type = EVP_PKEY_base_id(key);
+    if (type == EVP_PKEY_RSA)
+    {
+        return AccountKeyAlgorithm::RS256;
+    }
+    if (type == EVP_PKEY_EC)
+    {
+        return AccountKeyAlgorithm::ES256;
+    }
+
+    throw acme_lw::AcmeException("Unsupported account key algorithm");
+}
+
+string makeAccountJwk(EVP_PKEY * key, AccountKeyAlgorithm algorithm)
+{
+    if (algorithm == AccountKeyAlgorithm::RS256)
+    {
+#if OPENSSL_VERSION_MAJOR < 3
+        RSA * rsa = EVP_PKEY_get1_RSA(key);
+        if (!rsa)
+        {
+            throw acme_lw::AcmeException("Unable to read RSA account private key");
+        }
+
+        const BIGNUM *n, *e, *d;
+        RSA_get0_key(rsa, &n, &e, &d);
+        RSA_free(rsa);
+#else
+        BIGNUMptr nptr(BN_new()), eptr(BN_new());
+        const BIGNUM *n = *nptr;
+        const BIGNUM *e = *eptr;
+        if (EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_N, const_cast<BIGNUM **>(&n)) != 1 ||
+            EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_RSA_E, const_cast<BIGNUM **>(&e)) != 1)
+        {
+            throw acme_lw::AcmeException("Unable to read RSA account key parameters");
+        }
+#endif
+
+        return R"( {
+                                    "e":")"s + urlSafeBase64Encode(e) + R"(",
+                                    "kty": "RSA",
+                                    "n":")"s + urlSafeBase64Encode(n) + R"("
+                                })";
+    }
+
+#if OPENSSL_VERSION_MAJOR < 3
+    EC_KEYptr ecKey(EVP_PKEY_get1_EC_KEY(key));
+    const EC_GROUP * group = EC_KEY_get0_group(*ecKey);
+    if (!group)
+    {
+        throw acme_lw::AcmeException("Unable to read ECDSA account key group");
+    }
+
+    if (EC_GROUP_get_curve_name(group) != NID_X9_62_prime256v1)
+    {
+        throw acme_lw::AcmeException("ECDSA account key must use curve prime256v1 (P-256)");
+    }
+
+    const EC_POINT * publicPoint = EC_KEY_get0_public_key(*ecKey);
+    if (!publicPoint)
+    {
+        throw acme_lw::AcmeException("Unable to read ECDSA account public key");
+    }
+
+    BN_CTXptr bnContext(BN_CTX_new());
+    BIGNUMptr x(BN_new()), y(BN_new());
+    if (EC_POINT_get_affine_coordinates_GFp(group, publicPoint, *x, *y, *bnContext) != 1)
+    {
+        throw acme_lw::AcmeException("Unable to read ECDSA account key coordinates");
+    }
+
+    const BIGNUM *xCoordinate = *x;
+    const BIGNUM *yCoordinate = *y;
+#else
+    char groupName[64];
+    size_t groupNameLength = 0;
+    if (EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME, groupName, sizeof(groupName), &groupNameLength) != 1 ||
+        string(groupName, groupNameLength) != "prime256v1")
+    {
+        throw acme_lw::AcmeException("ECDSA account key must use curve prime256v1 (P-256)");
+    }
+
+    BIGNUMptr xptr(BN_new()), yptr(BN_new());
+    const BIGNUM *xCoordinate = *xptr;
+    const BIGNUM *yCoordinate = *yptr;
+    if (EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_X, const_cast<BIGNUM **>(&xCoordinate)) != 1 ||
+        EVP_PKEY_get_bn_param(key, OSSL_PKEY_PARAM_EC_PUB_Y, const_cast<BIGNUM **>(&yCoordinate)) != 1)
+    {
+        throw acme_lw::AcmeException("Unable to read ECDSA account key coordinates");
+    }
+#endif
+
+    // Note json keys must be in lexographical order.
+    return R"( {
+                                    "crv":"P-256",
+                                    "kty": "EC",
+                                    "x":")"s + urlSafeBase64Encode(xCoordinate) + R"(",
+                                    "y":")"s + urlSafeBase64Encode(yCoordinate) + R"("
+                                })";
+}
+
+EVP_PKEYptr makeCertificateKey(acme_lw::AcmeClient::CertificateKeyType keyType)
+{
+    if (keyType == acme_lw::AcmeClient::CertificateKeyType::ECDSA)
+    {
+        EVP_PKEY_CTX* rawContext = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, nullptr);
+        if (!rawContext)
+        {
+            throw acme_lw::AcmeException("Failure in EVP_PKEY_CTX_new_id for ECDSA");
+        }
+
+        EVP_PKEYptr key;
+        EVP_PKEY_CTXptr context(rawContext);
+        if (EVP_PKEY_keygen_init(*context) != 1 ||
+            EVP_PKEY_CTX_set_ec_paramgen_curve_nid(*context, NID_X9_62_prime256v1) != 1)
+        {
+            throw acme_lw::AcmeException("Failure initializing ECDSA key generation");
+        }
+
+        EVP_PKEY* rawKey = nullptr;
+        if (EVP_PKEY_keygen(*context, &rawKey) != 1)
+        {
+            throw acme_lw::AcmeException("Failure in EVP_PKEY_keygen for ECDSA");
+        }
+
+        return EVP_PKEYptr(rawKey);
+    }
+
+    // RSA default
+    const int bits = 4096;
+
+// OpenSSL 3 deprecates some functions and introduces new replacements
+#if OPENSSL_VERSION_MAJOR < 3
+    BIGNUMptr bn(BN_new());
+    if (!BN_set_word(*bn, RSA_F4))
+    {
+        throw acme_lw::AcmeException("Failure in BN_set_word");
+    }
+
+    RSAptr rsa(RSA_new());
+
+    if (!RSA_generate_key_ex(*rsa, bits, *bn, nullptr))
+    {
+        throw acme_lw::AcmeException("Failure in RSA_generate_key_ex");
+    }
+
+    EVP_PKEYptr key(EVP_PKEY_new());
+    if (!EVP_PKEY_assign_RSA(*key, *rsa))
+    {
+        throw acme_lw::AcmeException("Failure in EVP_PKEY_assign_RSA");
+    }
+    rsa.clear();     // rsa will be freed when key is freed.
+    return key;
+#else
+    return EVP_PKEYptr(EVP_RSA_gen(bits));
+#endif
+}
 
 void freeStackOfExtensions(STACK_OF(X509_EXTENSION) * e)
 {
@@ -231,36 +401,10 @@ string urlSafeBase64Encode(const BIGNUM * bn)
 }
 
 // returns pair<CSR, privateKey>
-pair<string, string> makeCertificateSigningRequest(const std::list<std::string>& domainNames)
+pair<string, string> makeCertificateSigningRequest(const std::list<std::string>& domainNames,
+                                                   acme_lw::AcmeClient::CertificateKeyType keyType)
 {
-    // Bump from 2048 to 4096
-    // https://www.schneier.com/blog/archives/2023/01/breaking-rsa-with-a-quantum-computer.html
-    const int bits = 4096;
-
-// OpenSSL 3 deprecates some functions and introduces new replacements
-#if OPENSSL_VERSION_MAJOR < 3
-    BIGNUMptr bn(BN_new());
-    if (!BN_set_word(*bn, RSA_F4))
-    {
-        throw acme_lw::AcmeException("Failure in BN_set_word");
-    }
-
-    RSAptr rsa(RSA_new());
-
-    if (!RSA_generate_key_ex(*rsa, bits, *bn, nullptr))
-    {
-        throw acme_lw::AcmeException("Failure in RSA_generate_key_ex");
-    }
-
-    EVP_PKEYptr key(EVP_PKEY_new());
-    if (!EVP_PKEY_assign_RSA(*key, *rsa))
-    {
-        throw acme_lw::AcmeException("Failure in EVP_PKEY_assign_RSA");
-    }
-    rsa.clear();     // rsa will be freed when key is freed.
-#else
-    EVP_PKEYptr key(EVP_RSA_gen(bits));
-#endif
+    EVP_PKEYptr key = makeCertificateKey(keyType);
 
     X509_REQptr req(X509_REQ_new());
 
@@ -392,50 +536,27 @@ string newOrderUrl;
 struct AcmeClientImpl
 {
     AcmeClientImpl(const string& accountPrivateKey)
-        : privateKey_(EVP_PKEY_new())
     {
         // Create the private key and 'header suffix', used to sign LE certs.
         BIOptr bio(BIO_new_mem_buf(accountPrivateKey.c_str(), -1));
-
-        // OpenSSL changed the API for reading RSA key components in version 3
-#if OPENSSL_VERSION_MAJOR < 3
-        const BIGNUM *n, *e, *d;
-
-        RSA * rsa(PEM_read_bio_RSAPrivateKey(*bio, nullptr, nullptr, nullptr));
-        if (!rsa)
-        {
-            throw AcmeException("Unable to read private key");
-        }
-
-        // rsa will get freed when privateKey_ is freed
-        if (!EVP_PKEY_assign_RSA(*privateKey_, rsa))
-        {
-            throw AcmeException("Unable to assign RSA to private key");
-        }
-
-        RSA_get0_key(rsa, &n, &e, &d);
-#else
-        BIGNUMptr nptr(BN_new()), eptr(BN_new());
-        const BIGNUM *n = *nptr;
-        const BIGNUM *e = *eptr;
-
         privateKey_ = PEM_read_bio_PrivateKey(*bio, nullptr, nullptr, nullptr);
-        EVP_PKEY_get_bn_param(*privateKey_, OSSL_PKEY_PARAM_RSA_N, const_cast<BIGNUM **>(&n));
-        EVP_PKEY_get_bn_param(*privateKey_, OSSL_PKEY_PARAM_RSA_E, const_cast<BIGNUM **>(&e));
-#endif
 
-        // Note json keys must be in lexographical order.
-        string jwkValue = R"( {
-                                    "e":")"s + urlSafeBase64Encode(e) + R"(",
-                                    "kty": "RSA",
-                                    "n":")"s + urlSafeBase64Encode(n) + R"("
-                                })";
+        if (!privateKey_)
+        {
+            throw AcmeException("Unable to read account private key");
+        }
+
+        accountAlgorithm_ = getAccountKeyAlgorithm(*privateKey_);
+
+        string jwkValue = makeAccountJwk(*privateKey_, accountAlgorithm_);
         jwkThumbprint_ = makeJwkThumbprint(jwkValue);
+
+        string jwsAlgorithm = (accountAlgorithm_ == AccountKeyAlgorithm::RS256 ? "RS256" : "ES256");
 
         // We use jwk for the first request, which allows us to get 
         // the account id. We use that thereafter.
         headerSuffix_ = R"(
-                "alg": "RS256",
+                "alg": ")" + jwsAlgorithm + R"(",
                 "jwk": )" + jwkValue + "}";
 
         pair<string, string> header = make_pair("location"s, ""s);
@@ -446,7 +567,7 @@ struct AcmeClientImpl
                                                 }
                                                 )", &header);
         headerSuffix_ = R"(
-                "alg": "RS256",
+                "alg": ")" + jwsAlgorithm + R"(",
                 "kid": ")" + header.second + "\"}";
     }
 
@@ -470,6 +591,24 @@ struct AcmeClientImpl
         if (EVP_DigestSignFinal(*context, &signature.front(), &signatureLength) != 1)
         {
             throw AcmeException("Error creating SHA256 digest in final signature");
+        }
+        signature.resize(signatureLength);
+
+        if (accountAlgorithm_ == AccountKeyAlgorithm::ES256)
+        {
+            const unsigned char* p = &signature.front();
+            ECDSA_SIGptr ecdsaSignature(d2i_ECDSA_SIG(nullptr, &p, signature.size()));
+            const BIGNUM *r, *sPart;
+            ECDSA_SIG_get0(*ecdsaSignature, &r, &sPart);
+
+            vector<unsigned char> rawSignature(64, 0);
+            if (BN_bn2binpad(r, &rawSignature.front(), 32) != 32 ||
+                BN_bn2binpad(sPart, &rawSignature.front() + 32, 32) != 32)
+            {
+                throw AcmeException("Error formatting ECDSA signature");
+            }
+
+            return urlSafeBase64Encode(rawSignature);
         }
 
         return urlSafeBase64Encode(signature);
@@ -561,7 +700,10 @@ struct AcmeClientImpl
         wait(challengeStatusUrl, "Failure / timeout verifying challenge passed");
     }
 
-    Certificate issueCertificate(const list<string>& domainNames, AcmeClient::Callback callback, AcmeClient::Challenge chg)
+    Certificate issueCertificate(const list<string>& domainNames,
+                                 AcmeClient::Callback callback,
+                                 AcmeClient::Challenge chg,
+                                 AcmeClient::CertificateKeyType keyType)
     {
         if (domainNames.empty())
         {
@@ -651,7 +793,7 @@ struct AcmeClientImpl
         }
 
         // Request the certificate
-        auto r = makeCertificateSigningRequest(domainNames);
+        auto r = makeCertificateSigningRequest(domainNames, keyType);
         string csr = r.first;
         string privateKey = r.second;
         sendRequest<vector<char>>(json.at("finalize"),
@@ -671,9 +813,10 @@ struct AcmeClientImpl
     }
 
 private:
-    string      headerSuffix_;
-    EVP_PKEYptr privateKey_;
-    string      jwkThumbprint_;
+    string              headerSuffix_;
+    EVP_PKEYptr          privateKey_;
+    string              jwkThumbprint_;
+    AccountKeyAlgorithm accountAlgorithm_;
 };
 
 AcmeClient::AcmeClient(const string& accountPrivateKey)
@@ -684,9 +827,12 @@ AcmeClient::AcmeClient(const string& accountPrivateKey)
 
 AcmeClient::~AcmeClient() = default;
 
-Certificate AcmeClient::issueCertificate(const std::list<std::string>& domainNames, Callback callback, Challenge chg)
+Certificate AcmeClient::issueCertificate(const std::list<std::string>& domainNames,
+                                         Callback callback,
+                                         Challenge chg,
+                                         CertificateKeyType keyType)
 {
-    return impl_->issueCertificate(domainNames, callback, chg);
+    return impl_->issueCertificate(domainNames, callback, chg, keyType);
 }
 
 void AcmeClient::init(Environment env)
