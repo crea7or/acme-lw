@@ -40,7 +40,7 @@ To use any _Let's Encrypt_ client you need to sign requests with the private key
 You'll want to keep control of that key in case you ever need to revoke the certificates that you issue. (In addition,
 Let's Encrypt [rate limits](https://letsencrypt.org/docs/rate-limits/#:~:text=You%20can%20create%20a%20maximum%20of%2010%20Accounts%20per%20IP,one%20account%20for%20many%20customers) account creation, so you'll normally want to re-use the same account.)
 
-This library uses a private key in PEM format. The [acme-tiny](https://github.com/diafygi/acme-tiny) library has 
+This library uses an account private key in PEM format. RSA keys and ECDSA P-256 keys are supported for account signing/challenges. The [acme-tiny](https://github.com/diafygi/acme-tiny) library has 
 [good documentation](https://github.com/diafygi/acme-tiny#step-1-create-a-lets-encrypt-account-private-key-if-you-havent-already) on how to create a new one or convert an existing certbot key to PEM format.
 
 #### Command Line Client
@@ -88,7 +88,9 @@ reads the account private key (in PEM format) from disk, so it needs to be reada
 You'll need to decide whether that's acceptable and if so which user you want to use. (You probably want to
 create one solely for this purpose.)
 
-The certificate issued uses a 4,096 bit RSA key.
+By default the certificate issued uses a 4,096 bit RSA key.
+
+The command line client also supports `-ecdsa` to issue certificates with an ECDSA P-256 private key.
 
 
 

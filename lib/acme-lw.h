@@ -83,13 +83,18 @@ public:
    
     enum class Challenge { HTTP, DNS };
 
+    enum class CertificateKeyType { RSA, ECDSA };
+
     /**
         Issue a certificate for the domainNames.
         The first one will be the 'Subject' (CN) in the certificate.
 
         throws std::exception, usually an instance of acme_lw::AcmeException
     */
-    Certificate issueCertificate(const std::list<std::string>& domainNames, Callback, Challenge chg = Challenge::HTTP);
+    Certificate issueCertificate(const std::list<std::string>& domainNames,
+                                 Callback,
+                                 Challenge chg = Challenge::HTTP,
+                                 CertificateKeyType keyType = CertificateKeyType::RSA);
 
     // Contact the Let's Encrypt production or staging environments
     enum class Environment { PRODUCTION, STAGING };

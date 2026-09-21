@@ -60,7 +60,8 @@ int main(int argc, char * argv[])
                 << "  * there must be at least one <domain-name>; the first will be the 'Subject' of the certificate\n"
                 << "  * options are:\n"
                 << "      -stg: use the Let's Encrypt staging environment (default is production)\n"
-                << "      -dns: use a DNS challenge (default is HTTP)\n";
+                << "      -dns: use a DNS challenge (default is HTTP)\n"
+                << "      -ecdsa: generate an ECDSA P-256 certificate key (default is RSA-4096)\n";
         return 0;
     }
 
@@ -72,6 +73,7 @@ int main(int argc, char * argv[])
 
         acme_lw::AcmeClient::Environment env = acme_lw::AcmeClient::Environment::PRODUCTION;
         acme_lw::AcmeClient::Challenge challenge = acme_lw::AcmeClient::Challenge::HTTP;
+        acme_lw::AcmeClient::CertificateKeyType keyType = acme_lw::AcmeClient::CertificateKeyType::RSA;
 
         list<string> domainNames;
         for (int i = 2; i < argc; ++i)
@@ -86,6 +88,11 @@ int main(int argc, char * argv[])
                 challenge = acme_lw::AcmeClient::Challenge::DNS;
                 continue;
             }
+            if ("-ecdsa"s == argv[i])
+            {
+                keyType = acme_lw::AcmeClient::CertificateKeyType::ECDSA;
+                continue;
+            }
             domainNames.push_back(argv[i]);
         }
         // Should be called once per process before a use of AcmeClient.
@@ -95,7 +102,7 @@ int main(int argc, char * argv[])
         acme_lw::AcmeClient::Callback callback = (challenge == acme_lw::AcmeClient::Challenge::HTTP) ? handleHTTPChallenge : 
                                                                                                        handleDNSChallenge;
 
-        acme_lw::Certificate certificate = acmeClient.issueCertificate(domainNames, callback, challenge);
+        acme_lw::Certificate certificate = acmeClient.issueCertificate(domainNames, callback, challenge, keyType);
 
         writeFile("fullchain.pem", certificate.fullchain);
         writeFile("privkey.pem", certificate.privkey);
